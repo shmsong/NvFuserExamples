@@ -1,2 +1,4 @@
 .clang-format-bin
 build
+*.egg-info
+dist

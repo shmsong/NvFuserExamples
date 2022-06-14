@@ -3,6 +3,7 @@
 #include <torch/csrc/jit/codegen/cuda/arith.h>
 #include <torch/csrc/jit/codegen/cuda/executor.h>
 #include <torch/csrc/jit/codegen/cuda/scheduler/all_schedulers.h>
+#include <torch/csrc/jit/codegen/cuda/scheduler/utils.h>
 #include <torch/extension.h>
 
 #include <memory>
@@ -11,26 +12,26 @@ using namespace torch::jit::fuser::cuda;
 
 namespace {
 
+TensorView *makeConcreteTensor(std::vector<int64_t> shape,
+                               DataType dtype = DataType::Float) {
+  return TensorViewBuilder().shape(shape).dtype(dtype).build();
+}
+
 class FMHAKernel : public NVFuserOpBase<FMHAKernel> {
 public:
   c10::optional<LaunchParams> fusedKernel(Fusion &fusion,
                                           std::vector<c10::IValue> inputs) {
-    Fusion fusion;
-    FusionGuard fg(&fusion);
-
-    // Omitting outer dimensions and pointwise ops
-
-    const int seql_q = 32;
+    const int seql_q = 128;
     const int seql_k = 128;
     const int hidden_size = 1024;
     const int num_heads = 16;
     const int head_dim = hidden_size / num_heads;
 
     // Gemm 1:
-    // (80, 80, 64)
     const int M1 = seql_q, N1 = seql_k, K1 = head_dim;
-    // (80, 64, 80)
-    const int M2 = seql_q, N2 = head_dim, K2 = seql_k;
+
+    // Gemm 2:
+    const int N2 = head_dim, K2 = seql_k;
 
     // Fusion definition (TN -> TT)
     // [M,K1]
@@ -73,7 +74,7 @@ public:
     // Inline define softmax for now for scheduling
     auto max_val = max(tvp_masked, {kReductionAxis});
     auto bcast_max = broadcast(max_val, broadcast_mask);
-    auto x_max_sub = sub(tvp, bcast_max);
+    auto x_max_sub = sub(tvp_masked, bcast_max);
     auto exp_val = exp(x_max_sub);
     auto sum_exp = sum(exp_val, {kReductionAxis});
     auto bcast_sum = broadcast(sum_exp, broadcast_mask);
@@ -137,7 +138,7 @@ public:
     gemm_tile2.instruction_tile = GemmTile(16, 8, 16);
 
     auto mma_builder2 =
-        MmaBuilder(MmaOptions::MacroType::Ampere_16_8_16, gemm_tile)
+        MmaBuilder(MmaOptions::MacroType::Ampere_16_8_16, gemm_tile2)
             .layout(MmaOptions::MmaInputLayout::TT);
 
     // Global read for matmul 1
@@ -355,6 +356,8 @@ public:
                                                                    gemm_tile2);
 
     // Schedule v gmem read:
+    vcw->merge(-2);
+    vr->merge(-2);
     scheduler_utils::matmul_utils::scheduleContiguousVectorLoad(vr, gemm_tile2,
                                                                 8);
 
@@ -364,6 +367,7 @@ public:
     vcw->setMemoryType(MemoryType::Shared);
 
     vcr->computeAt(tvout_acc, -4);
+
     tvphcr->computeAt(tvout_acc, -4);
 
     tvphcr->applyMmaSwizzle(
@@ -401,10 +405,8 @@ public:
 
     tvouth->axis(0)->parallelize(ParallelType::BIDx);
     tvouth->axis(2)->parallelize(ParallelType::TIDy);
+    tvouth->axis(-2)->parallelize(ParallelType::TIDx);
     tvouth->axis(-1)->parallelize(ParallelType::Vectorize);
-
-    fusion.printMath();
-    fusion.printKernel();
 
     return c10::nullopt;
   }
@@ -412,14 +414,15 @@ public:
 
 } // namespace
 
-at::Tensor fmha_nvfuser(const at::Tensor &input) {
-  auto outputs = _fmha_kernel.run({input});
+at::Tensor fmha_nvfuser(const at::Tensor &input, const at::Tensor &qk,
+                        const at::Tensor &v, const at::Tensor &amask) {
+  auto outputs = _fmha_kernel.run({input, qk, v, amask});
   return outputs[0];
 }
 
-TORCH_LIBRARY(manual_fmha, m) { m.def("fmha_nvfuser", fmha_nvfuser); }
+TORCH_LIBRARY(mha_manual, m) { m.def("fmha_nvfuser", fmha_nvfuser); }
 
-TORCH_LIBRARY_IMPL(manual_fmha, CUDA, m) {
+TORCH_LIBRARY_IMPL(mha_manual, CUDA, m) {
   m.impl("fmha_nvfuser", fmha_nvfuser);
 }
 

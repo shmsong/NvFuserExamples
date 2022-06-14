@@ -1,5 +1,7 @@
 
-using namespace torch::jit::fuser::cuda;
+#pragma once
+
+#include <torch/csrc/jit/codegen/cuda/executor.h>
 
 namespace torch {
 namespace jit {
