@@ -12,7 +12,7 @@ batch = 32
 def eager_mha(q,k,v,amask):
     p = q.matmul(k.permute((0,2,1)))
     # dropout emulation, assume d=64
-    p_masked = p / 8 + (1.0 - amask) * -10000.0
+    p_masked = (p / 8) * amask
     s = torch.softmax(p_masked, -1)
     ctx = torch.matmul(s, v)
     return ctx
