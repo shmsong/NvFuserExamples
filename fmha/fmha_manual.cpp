@@ -26,6 +26,7 @@ public:
     const int hidden_size = 1024;
     const int num_heads = 16;
     const int head_dim = hidden_size / num_heads;
+    const int batch = 32;
 
     // Gemm 1:
     const int M1 = seql_q, N1 = seql_k, K1 = head_dim;
@@ -35,27 +36,28 @@ public:
 
     // Fusion definition (TN -> TT)
     // [M,K1]
-    auto inp = makeConcreteTensor({M1, K1}, DataType::Half);
+    auto inp = makeConcreteTensor({batch * num_heads, M1, K1}, DataType::Half);
     // Query matrix
-    auto qk = makeConcreteTensor({N1, K1}, DataType::Half);
+    auto qk = makeConcreteTensor({batch * num_heads, N1, K1}, DataType::Half);
     // V matrix
-    auto v = makeConcreteTensor({K2, N2}, DataType::Half);
+    auto v = makeConcreteTensor({batch * num_heads, K2, N2}, DataType::Half);
 
     // Mask 1.0 or 0.0
-    auto amask = makeConcreteTensor({M1, N1}, DataType::Half);
+    auto amask =
+        makeConcreteTensor({batch * num_heads, M1, N1}, DataType::Half);
 
     fusion.addInput(inp);
     fusion.addInput(qk);
     fusion.addInput(v);
     fusion.addInput(amask);
 
-    // [M,N,K]
-    auto tv0b = broadcast(inp, {false, true, false});
-    auto tv1b = broadcast(qk, {true, false, false});
-    auto tv2b = broadcast(v, {true, false, false});
+    // [B,M,N,K]
+    auto tv0b = broadcast(inp, {false, false, true, false});
+    auto tv1b = broadcast(qk, {false, true, false, false});
+    auto tv2b = broadcast(v, {false, true, false, false});
 
-    // [M,K2,R]
-    auto tvp = fusedMultiplySum(tv0b, tv1b, {2});
+    // [B,M,K2,R]
+    auto tvp = fusedMultiplySum(tv0b, tv1b, {3});
 
     // Dropout
     // p_masked = p / math.sqrt(d) + (1.0 - amask) * -10000.0
@@ -68,8 +70,9 @@ public:
     // Approximated masking from contrib reference.
     auto tvp_masked = add(tvp_scaled, mask_value);
 
-    const int kReductionAxis = 1;
-    std::vector<bool> broadcast_mask{false, true};
+    // [B, M, N]
+    const int kReductionAxis = 2;
+    std::vector<bool> broadcast_mask{false, false, true};
 
     // Inline define softmax for now for scheduling
     auto max_val = max(tvp_masked, {kReductionAxis});
@@ -84,10 +87,10 @@ public:
     auto tvph = castOp(DataType::Half, tvpsfm);
 
     // Second matmul:
-    auto tvpb = broadcast(tvph, {false, false, true});
+    auto tvpb = broadcast(tvph, {false, false, false, true});
 
     // TODO: should we just add NN matmul?
-    auto tvout = fusedMultiplySum(tvpb, tv2b, {1});
+    auto tvout = fusedMultiplySum(tvpb, tv2b, {2});
 
     auto tvouth = castOp(DataType::Half, tvout);
 
@@ -288,23 +291,26 @@ public:
     tvp->setMemoryType(MemoryType::Shared);
 
     // Set the outer most dimension
-    tvp->axis(0)->parallelize(ParallelType::BIDx);
-    tvpc->axis(0)->parallelize(ParallelType::BIDx);
-    tvpc->axis(3)->parallelize(ParallelType::TIDy);
-    tvp->axis(2)->parallelize(ParallelType::TIDy);
+    tvp->axis(1)->parallelize(ParallelType::BIDx);
+    tvpc->axis(1)->parallelize(ParallelType::BIDx);
+    tvp->axis(0)->parallelize(ParallelType::BIDy);
+    tvpc->axis(0)->parallelize(ParallelType::BIDy);
+    tvpc->axis(4)->parallelize(ParallelType::TIDy);
+    tvp->axis(3)->parallelize(ParallelType::TIDy);
 
     // Load un-swizzled value back to do register persistence
 
     // Softmax on a 16x128 tile:
 
     // distribute load to 4 warps:
-    // [Block, I16, R128]
+    // [Batch, Block, I16, R128]
 
     auto schedule_epilog_tv = [&gemm_tile](TensorView *tv) {
-      tv->split(0, gemm_tile.cta_tile.m);
+      tv->split(1, gemm_tile.cta_tile.m);
       tv->split(-2, 4);
       tv->split(-1, 32);
-      tv->axis(0)->parallelize(ParallelType::BIDx);
+      tv->axis(1)->parallelize(ParallelType::BIDx);
+      tv->axis(0)->parallelize(ParallelType::BIDy);
       tv->axis(-1)->parallelize(ParallelType::TIDx);
       tv->axis(-3)->parallelize(ParallelType::TIDy);
     };
@@ -337,15 +343,15 @@ public:
     // Accumulator register:
     auto tvout_acc = tvout->cacheBefore();
 
-    tvout->split(0, gemm_tile2.cta_tile.m);
+    tvout->split(-2, gemm_tile2.cta_tile.m);
     // [Mo, M16, N64]
-    tvouth->split(0, gemm_tile2.cta_tile.m);
+    tvouth->split(-2, gemm_tile2.cta_tile.m);
 
-    tvout_acc->split(0, gemm_tile2.cta_tile.m);
+    tvout_acc->split(-3, gemm_tile2.cta_tile.m);
 
     // [Mo, M16, K128, N64]
-    vr->computeAt(tvout_acc, 1);
-    tvphcr->computeAt(tvout_acc, 1);
+    vr->computeAt(tvout_acc, -4);
+    tvphcr->computeAt(tvout_acc, -4);
 
     // Schedule tvout accumulator:
     scheduler_utils::matmul_utils::scheduleWarpTileWithReduction(tvout_acc,
@@ -394,17 +400,21 @@ public:
     sum_exp->rFactor({-2});
 
     // Parallelize:
-    tvout_acc->axis(0)->parallelize(ParallelType::BIDx);
-    tvout_acc->axis(2)->parallelize(ParallelType::TIDy);
+    tvout_acc->axis(0)->parallelize(ParallelType::BIDy);
+    tvout_acc->axis(1)->parallelize(ParallelType::BIDx);
+    tvout_acc->axis(3)->parallelize(ParallelType::TIDy);
 
-    tvout->axis(0)->parallelize(ParallelType::BIDx);
-    tvout->axis(2)->parallelize(ParallelType::TIDy);
+    tvout->axis(0)->parallelize(ParallelType::BIDy);
+    tvout->axis(1)->parallelize(ParallelType::BIDx);
+    tvout->axis(3)->parallelize(ParallelType::TIDy);
 
-    tvouthc->axis(0)->parallelize(ParallelType::BIDx);
-    tvouthc->axis(2)->parallelize(ParallelType::TIDy);
+    tvouthc->axis(0)->parallelize(ParallelType::BIDy);
+    tvouthc->axis(1)->parallelize(ParallelType::BIDx);
+    tvouthc->axis(3)->parallelize(ParallelType::TIDy);
 
-    tvouth->axis(0)->parallelize(ParallelType::BIDx);
-    tvouth->axis(2)->parallelize(ParallelType::TIDy);
+    tvouth->axis(0)->parallelize(ParallelType::BIDy);
+    tvouth->axis(1)->parallelize(ParallelType::BIDx);
+    tvouth->axis(3)->parallelize(ParallelType::TIDy);
     tvouth->axis(-2)->parallelize(ParallelType::TIDx);
     tvouth->axis(-1)->parallelize(ParallelType::Vectorize);
 
