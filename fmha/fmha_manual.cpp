@@ -145,13 +145,10 @@ public:
             .layout(MmaOptions::MmaInputLayout::TT);
 
     // Global read for matmul 1
-    auto tv0r = inp->cacheAfter();
-    auto tv1r = qk->cacheAfter();
-
     // Gemm 1 main loop read
-    auto tv0cw = tv0r->cacheAfter();
+    auto tv0cw = inp->cacheAfter(LoadStoreOpType::CpAsync);
     auto tv0cr = tv0cw->cacheAfter(LoadStoreOpType::LdMatrix);
-    auto tv1cw = tv1r->cacheAfter();
+    auto tv1cw = qk->cacheAfter(LoadStoreOpType::CpAsync);
     auto tv1cr = tv1cw->cacheAfter(LoadStoreOpType::LdMatrix);
 
     // Gemm 1 accumulator reg
@@ -204,8 +201,8 @@ public:
     // Inline the prolog:
     //  0   1  2   3     4    5
     // [Mo,No, Ko M128, N128, K32]
-    tv0r->computeAt(tvpc, -4);
-    tv1r->computeAt(tvpc, -4);
+    tv0cw->computeAt(tvpc, -4);
+    tv1cw->computeAt(tvpc, -4);
 
     // Make warp tile:
     // -------------------------------------------------------------------------
@@ -234,15 +231,10 @@ public:
     // ---------------------------------------------------------------------------
     // [Mo,Ko,M,K]
     tv0cw->merge(-2);
-    tv0r->merge(-2);
 
     // 128b vector load from gmem
     scheduler_utils::matmul_utils::scheduleContiguousVectorLoad(tv0cw,
                                                                 gemm_tile, 8);
-
-    // 128b vector store into smem
-    scheduler_utils::matmul_utils::scheduleContiguousVectorLoad(tv0r, gemm_tile,
-                                                                8);
 
     tv0cw->setMemoryType(MemoryType::Shared);
 
@@ -250,16 +242,10 @@ public:
     if (tv1cw->axis(-1)->extent()->evaluateInt() == 128) {
       tv1cw->reorder({{-1, -2}, {-2, -1}});
     }
-    if (tv1r->axis(-1)->extent()->evaluateInt() == 128) {
-      tv1r->reorder({{-1, -2}, {-2, -1}});
-    }
     tv1cw->merge(-2);
-    tv1r->merge(-2);
     // [No,Ko,i,wy,wx,v]
     scheduler_utils::matmul_utils::scheduleContiguousVectorLoad(tv1cw,
                                                                 gemm_tile, 8);
-    scheduler_utils::matmul_utils::scheduleContiguousVectorLoad(tv1r, gemm_tile,
-                                                                8);
     tv1cw->setMemoryType(MemoryType::Shared);
 
     // Schedule mma input
@@ -284,9 +270,6 @@ public:
     tvp->applyMmaSwizzle(
         mma_builder1.operand(MmaOptions::Operand::Accumulator).build());
 
-    // mma_util::WarpMmaSwizzler::scheduleMmaWarpOutput(tvpccw,
-    // mma_builder1.build());
-
     // Put tvp result in smem
     tvp->setMemoryType(MemoryType::Shared);
 
@@ -297,6 +280,9 @@ public:
     tvpc->axis(0)->parallelize(ParallelType::BIDy);
     tvpc->axis(4)->parallelize(ParallelType::TIDy);
     tvp->axis(3)->parallelize(ParallelType::TIDy);
+
+    tv0cr->doubleBuffer();
+    tv1cr->doubleBuffer();
 
     // Load un-swizzled value back to do register persistence
 

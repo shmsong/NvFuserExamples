@@ -26,4 +26,4 @@ fused_output = torch.ops.mha_manual.fmha_nvfuser(q,k,v,amask)
 ctx = reference_mha(q,k,v,amask)
 
 print(f"ABS diff: {(ctx-fused_output).abs().max()}")
-assert torch.allclose(ctx, fused_output, atol=1e-3)
+assert torch.allclose(ctx, fused_output, atol=1e-2)
