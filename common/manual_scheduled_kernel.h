@@ -12,6 +12,7 @@ template <typename NvFuserOp> class NVFuserOpBase {
 public:
   std::vector<at::Tensor> run(std::vector<c10::IValue> input) {
     if (!compiled_kernel_.compiled()) {
+      std::cout<<"NVFuser : compiling fused kernel.\n";
       compileFusion(input);
     }
     return compiled_kernel_.runFusion(input, launch_constraint_);
