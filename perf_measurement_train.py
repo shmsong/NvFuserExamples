@@ -19,7 +19,11 @@ def reference_mha(q, k, v, pad_mask, dropout_mask):
      out5 = (out4 / dropout_prob) * dropout_mask
      out6 = torch.matmul(out5, v)
      return out4, out5, out6
- 
+
+fused_mha = torch.ops.mha_manual.fmha_train_nvfuser
+fused_mha_saveim = torch.ops.mha_manual.fmha_train_saveim_nvfuser
+
+# test inputs
 q = torch.randn((batch*num_heads, seql_q, head_dim), dtype=torch.half, device='cuda')
 k = torch.randn((batch*num_heads, seql_k, head_dim), dtype=torch.half, device='cuda')
 v = torch.randn((batch*num_heads, seql_k, head_dim), dtype=torch.half, device='cuda')
@@ -27,15 +31,30 @@ scale = 1. / 8 # assume d=64
 pad_mask = torch.empty((batch*num_heads, seql_q, seql_k),device="cuda").random_(2).to(torch.half) * (-1000)
 dropout_mask = torch.empty((batch*num_heads, seql_q, seql_k),device="cuda").random_(2).to(torch.half)
 
-# fused_output = torch.ops.mha_manual.fmha_nvfuser(q,k,v,amask)
-softmax_o, dropout_o, ctx = reference_mha(q, k, v, pad_mask, dropout_mask)
-ctx_fused = torch.ops.mha_manual.fmha_train_nvfuser(q,k,v, pad_mask, dropout_mask)
-saved_outputs = torch.ops.mha_manual.fmha_train_saveim_nvfuser(q,k,v, pad_mask, dropout_mask)
+# Utility to run perf measurement
+def run_perf_test(op,description,*args):
+    # setup timer
+    start = torch.cuda.Event(enable_timing=True)
+    stop = torch.cuda.Event(enable_timing=True)
 
-print(f"ABS diff: {(ctx_fused-ctx).abs().max()}")
-assert torch.allclose(ctx_fused, ctx, atol=1e-2)
+    warm_up_iter = 10
+    measure_iter = 1000
 
-print(f"ABS diff ctx: {(saved_outputs[0]-ctx).abs().max()}")
-print(f"ABS diff softmax: {(saved_outputs[1]-softmax_o).abs().max()}")
-print(f"ABS diff dropout_o: {(saved_outputs[2]-dropout_o).abs().max()}")
-assert torch.allclose(saved_outputs[0], ctx, atol=1e-2)
+    # warm up run
+    with torch.no_grad():
+        for _ in range(warm_up_iter):
+            op(*args)
+        start.record()
+        for _ in range(measure_iter):
+            op(*args)
+        stop.record()
+    start.synchronize()
+    stop.synchronize()
+
+    iter_time_ms = start.elapsed_time(stop) / measure_iter
+
+    print(f"{description} : {iter_time_ms} ms / iter")
+
+run_perf_test(fused_mha, "fused mha no permute", q,k,v, pad_mask, dropout_mask)
+run_perf_test(fused_mha_saveim, "fused mha no permute, save im", q,k,v, pad_mask, dropout_mask)
+run_perf_test(reference_mha, "eager mode mha no permute", q,k,v, pad_mask, dropout_mask)
