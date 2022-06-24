@@ -12,10 +12,10 @@ template <typename NvFuserOp> class NVFuserOpBase {
 public:
   std::vector<at::Tensor> run(std::vector<c10::IValue> input) {
     if (!compiled_kernel_.compiled()) {
-      std::cout<<"NVFuser : compiling fused kernel.\n";
+      std::cout << "NVFuser : compiling fused kernel.\n";
       compileFusion(input);
     }
-    return compiled_kernel_.runFusion(input, launch_constraint_);
+    return compiled_kernel_.runFusion(input, launch_constraint_, 1);
   }
 
   c10::optional<LaunchParams> fusedKernel(Fusion &fusion,
@@ -36,8 +36,15 @@ private:
       launch_constraint_ = maybe_lparams.value();
     }
 
+    // In simple demonstration case, always use 32b index mode
+    //  this is manually adjusted in lower level, but
+    //  in higher level integration it is automatically set based
+    //  on input tensor sizes.
+    CompileOptions options;
+    options.index_mode = KernelIndexMode::INT32;
+
     // Compile fusion into kernel
-    compiled_kernel_.compileFusion(&fusion, input, launch_constraint_);
+    compiled_kernel_.compileFusion(&fusion, input, launch_constraint_, options);
   }
 
   // Internal CRTP dispatcher.
