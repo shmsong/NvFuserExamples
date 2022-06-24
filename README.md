@@ -1,4 +1,4 @@
-Examples of manually fused kernels with nvfuser, currently only fused multihead attention forward pass.
+Examples of manually fused kernels with nvfuser. Be sure to have a cuda-enabled pytorch installed before building this one.
 
 # Build
 
